@@ -1,20 +1,21 @@
-# victory-frametime
+# victory-frametime — dev-only dump patch
 
-A small patch for [VIctory](https://github.com/Marvisak/VIctory) and its community forks that makes
-the GPU layer write a **frametime CSV**: one row per ~1 s summary interval, with the frame time and
-the buckets the runtime already measures, plus the worst and average **single** frame over the
-interval.
-
-It contains **no game files or assets**. It is a patch against the open-source runtime (GPL-3.0).
+The frametime dump from [skornuta/victory-fork](https://github.com/skornuta/victory-fork), packaged
+as a patch any VIctory fork can apply. **This repo is the dev/tool repo**; the playable fork is the
+main one. No game files or assets are included.
 
 ## What it adds
 
-- New module `crates/victory-gpu/src/frametime.rs`.
-- `VICTORY_FRAMETIME_DUMP=<path>` writes the CSV there; `=1` writes `%TEMP%\victory-frametime.csv`.
-- One `tick()` per present and one `record(...)` at the existing frame summary in `Host::frame`.
-- Release-buildable: no `diagnostics` feature needed.
+- `VICTORY_FRAMETIME_DUMP=<path>` writes a CSV; `=1` writes `<cache>\frametime.csv` (default
+  `%LOCALAPPDATA%\victory\cache\frametime.csv`).
+- One row per ~1 s summary interval with the frame time and the buckets the runtime already
+  measures (`gpu_ms`, `cpu_prepare_ms`, `copies_ms`, `textures_ms`, `copyback_ms`, `heap_ms`,
+  `card_*`, …), plus the worst/average **single** frame.
+- A `#` header block with CPU, GPU + VRAM, **NVIDIA driver**, RAM, OS, board, display, the
+  `VICTORY_*` switches and the title-build hash.
+- Release-buildable; no `diagnostics` feature.
 
-## For an agent (fastest path)
+## For an agent (fastest)
 
 ```sh
 git clone <your victory fork>
@@ -26,76 +27,92 @@ cargo build --release -p victory
 Then run the title with:
 
 ```bat
-set VICTORY_FRAMETIME_DUMP=%TEMP%\frametime.csv
-victory run <game>\<title>.exe --execute
+set VICTORY_FRAMETIME_DUMP=1
+target\release\victory.exe run "D:\game\game.exe" --execute
 ```
 
-If `git am` fails because the fork has drifted, the change is four small pieces:
+or `run-frametime.cmd "D:\game\game.exe"` from the repo root.
+
+Confirm the log prints `frametime dump path=...` when the first frame lands. The file is at
+`%LOCALAPPDATA%\victory\cache\frametime.csv` (`victory config` prints `cache_dir`).
+
+## Manual integration (if the patch doesn't apply)
+
+The patch touches five places; use it as the exact reference.
 
 1. Copy `frametime.rs` into `crates/victory-gpu/src/`.
-2. In `crates/victory-gpu/src/lib.rs`, add `mod frametime;` next to `mod frame;`.
-3. In `crates/victory-gpu/src/queue.rs`, add
+2. `crates/victory-gpu/src/lib.rs`: add `pub mod frametime;` next to `pub mod frame;`.
+3. `crates/victory-gpu/src/queue.rs`: add
    `pub(crate) fn frame_count() -> u64 { FRAMES.load(Ordering::Relaxed) }`.
-4. In `crates/victory-gpu/src/host.rs`, inside `fn frame(&mut self, hwnd: HWND)`:
-   - call `crate::frametime::tick();` at the top (every present, before the 1 s early return);
-   - insert `crate::frametime::record(&crate::frametime::Row { ... })` where the summary already
-     computes `fps`, `ms`, `cpu`, `gpu`, `copy_ms`, `copy_mb`, `texture_ms`, `texture_mb`,
-     `back_ms`, `back_mb`, `dropped`, `indirect`, `picked`, `picked_ms`, `card`, `twin_to_depth`,
-     `twin_to_colour`, `planes`, and the card/texture pass values. `victory-frametime.patch` shows
-     the exact insertion.
+4. `crates/victory-gpu/src/host.rs`:
+   - add `pub(crate) fn adapter_summary()` (the DXGI adapter's name + dedicated VRAM);
+   - call `crate::frametime::tick();` at the top of `fn frame(&mut self, hwnd)`;
+   - hoist `card_passes`/`card_compares` and `texture_refresh_ms` out of their blocks;
+   - insert `crate::frametime::record(&crate::frametime::Row { ... })` before the periodic
+     `if self.logged.elapsed() >= 5 s` block, using the values already computed there.
+5. `crates/victory-gpu/Cargo.toml`: add `"Win32_System_Registry"` to the `windows-sys` features.
+6. `apps/victory/Cargo.toml`: add `victory-gpu.workspace = true`.
+7. `apps/victory/src/run.rs`: after `Config::load()`, if `VICTORY_FRAMETIME_DUMP` is `1`, call
+   `victory_gpu::frametime::use_dump_path(cfg.cache_dir.join("frametime.csv"))`; pass the detected
+   build label with `victory_gpu::frametime::use_build_label(label)`.
 
-No `diagnostics` feature: the point is to profile release builds.
+## If you merge this into your fork
 
-## Columns
+Add a short section to **your own README** (and to your agent instructions) saying how to enable
+the dump and where it goes. Copy this:
 
-`t_ms,frame,frames,fps,ms_per_frame,frame_ms_max,frame_ms_avg,cpu_prepare_ms,gpu_ms,gpu_pct,copies_ms,copies_mb,textures_ms,textures_mb,copyback_ms,copyback_mb,draws,dropped,making,indirect,heap_passes,heap_ms,texture_refresh_ms,card_passes,card_compares,card_sent_mb,card_ranges,card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct`
+```markdown
+## Frametime dump
+Build first: `cargo build --release -p victory`.
+Run with `VICTORY_FRAMETIME_DUMP=1` (or `run-frametime.cmd "<title.exe>"`).
+The CSV is at `%LOCALAPPDATA%\victory\cache\frametime.csv` (`victory config` prints `cache_dir`);
+old patches wrote `%TEMP%\victory-frametime.csv`. The log prints `frametime dump path=...`.
+```
 
-| Column | Meaning |
+Keep it in your README when the dump changes, so people who find your fork do not have to come back
+here.
+
+## Where the dump goes
+
+| `VICTORY_FRAMETIME_DUMP` | File |
 |---|---|
-| `frame_ms_max` / `frame_ms_avg` | worst / mean **single** frame between presents (load pauses count as gaps) |
-| `cpu_prepare_ms` | CPU time building the frame's command lists |
-| `gpu_ms` / `gpu_pct` | GPU time on our work / GPU busy share |
-| `copies_ms` / `copies_mb` | CPU time / MB copying game memory for the GPU |
-| `textures_ms` / `textures_mb` | CPU time / MB refreshing (copying + detiling) textures |
-| `copyback_ms` / `copyback_mb` | time / MB reading GPU results back |
-| `draws` / `dropped` | draw & mesh-dispatch calls attempted / skipped for lack of a pipeline |
-| `heap_ms` | the by-index resource-table pass (`State::heap_buffers`): walk buffer views, resolve host copies, merge ranges, queue refreshes, pick textures. Bookkeeping, not the byte copy; overlaps `cpu_prepare_ms` |
-| `texture_refresh_ms` | the actual texture refresh inside `textures_ms` |
-| `card_*` | hash/compare passes over copies in GPU (card) memory, MB sent up/fetched, waits |
-| `twins_*` / `depth_planes` | depth-texture/colour-twin copies and depth planes drawn from twins |
+| unset or empty | no dump |
+| `1` | `%LOCALAPPDATA%\victory\cache\frametime.csv` (follows `cache_dir`) |
+| any other value | exactly that path (its folder must already exist) |
 
-## What it found (sample)
+Created on the first presented frame (~1 s), truncated each run. The log prints
+`frametime dump path=...` when it opens.
 
-RTX 5080 16 GB, Ryzen 7 9800X3D, 32 GB, 1440p, Series X profile, build `3346d57` (merge of
-`ZSlayerHQ/victory-world-runtime` `next`). Settled world (last 40% of samples):
+## If no file appears
 
-| bucket | default | `VICTORY_UNWATCHED_FRAMES=2` |
-|---|---:|---:|
-| fps | 4.07 | 4.41 |
-| ms/frame | 259.6 | 226.9 |
-| gpu_ms | 95.5 | 98.0 |
-| cpu_prepare_ms | 69.1 | 64.4 |
-| copies_ms | 41.3 | 37.5 |
-| copyback_ms | 28.4 | 27.5 |
-| textures_ms | 4.1 | 3.3 |
-| heap_ms | 62.3 (median ~18) | 13.0 (median ~11) |
-| draws/frame | 4,833 | 4,462 |
-| dropped/frame | 415 | 351 |
+- `git pull` without `cargo build --release -p victory` → still the old exe.
+- Running a `victory.exe` from another folder or profile → run `target\release\victory.exe`.
+- No `frametime dump path=...` in the log → that build has no dump, or it never presented a frame.
+- Pre-`646f5cf` builds wrote `=1` to `%TEMP%\victory-frametime.csv`.
+- PowerShell does not expand `%LOCALAPPDATA%`; use `$env:LOCALAPPDATA` or the `.cmd`.
 
-The 1–2 s drops were dominated by `heap_ms` (1,000–2,164 ms) and `textures_ms` (up to 1,813 ms)
-while the GPU was idle — i.e. the by-index/asset-streaming pass, not the GPU and not the file read.
-Separately, 2.5–4.9 s gaps between presents showed no heap/GPU cost and are not attributed yet.
+## Keeping it in sync
 
-Not a controlled A/B: the two settle points had different draw counts.
+This patch is generated from the main fork over the dump paths. After changing the dump in the main
+fork, regenerate it there:
+
+```sh
+git diff --output=../victory-frametime/victory-frametime.patch 3346d57..HEAD -- \
+  crates/victory-gpu/src/frametime.rs crates/victory-gpu/src/lib.rs \
+  crates/victory-gpu/src/queue.rs crates/victory-gpu/src/host.rs \
+  crates/victory-gpu/Cargo.toml apps/victory/Cargo.toml apps/victory/src/run.rs
+```
+
+Copy `crates/victory-gpu/src/frametime.rs` and `run-frametime.cmd` over too, then commit both repos.
 
 ## Samples
 
-- `samples/report.md` — the writeup above in longer form.
-- `samples/baseline.csv` — default switches, 176 intervals (~4 min).
+- `samples/baseline.csv` — pre-fold world, 176 intervals.
 - `samples/u2.csv` — `VICTORY_UNWATCHED_FRAMES=2`, 271 intervals.
-- `analyze.ps1 <csv>` — prints means/medians, the slowest intervals, and the slowest single frames.
+- `samples/frametime_5080_9800x3d_fold_2026-11-25_world.csv` — fold on, 628 intervals (~12 min).
+- `samples/report.md` — the longer writeup.
+- `analyze.ps1 <csv>` — means/medians, slowest intervals, slowest single frames (skips `#`).
 
-## Credits / license
+## Credits / licence
 
-VIctory is by Marvisak and contributors; this patch follows upstream's GPL-3.0. No game files or
-assets are included or required.
+VIctory is by Marvisak and contributors; this patch follows upstream's GPL-3.0. No game files.
