@@ -1,0 +1,380 @@
+From b21f7a2d298074d0498891b71ef30154b549cb61 Mon Sep 17 00:00:00 2001
+From: stas <kornutastanislaw@gmail.com>
+Date: Tue, 24 Nov 2026 21:41:38 -0800
+Subject: [PATCH] victory-gpu: VICTORY_FRAMETIME_DUMP (CSV of per-interval
+ frame buckets + worst/avg present)
+
+---
+ crates/victory-gpu/src/frametime.rs | 212 ++++++++++++++++++++++++++++
+ crates/victory-gpu/src/host.rs      |  91 ++++++++----
+ crates/victory-gpu/src/lib.rs       |   1 +
+ crates/victory-gpu/src/queue.rs     |   5 +
+ 4 files changed, 283 insertions(+), 26 deletions(-)
+ create mode 100644 crates/victory-gpu/src/frametime.rs
+
+diff --git a/crates/victory-gpu/src/frametime.rs b/crates/victory-gpu/src/frametime.rs
+new file mode 100644
+index 0000000..bdd805e
+--- /dev/null
++++ b/crates/victory-gpu/src/frametime.rs
+@@ -0,0 +1,212 @@
++//! A frametime dump (`VICTORY_FRAMETIME_DUMP`): one CSV row per summary
++//! interval, with the frame time and the buckets `host.rs` already measures
++//! (preparing, copies, textures, GPU, copy-back, heap-buffer passes, texture
++//! refreshes, the passes over the card's copies), plus the worst and average
++//! frame over the interval, measured at every present.
++//!
++//! `VICTORY_FRAMETIME_DUMP=<path>` writes it there; `=1` writes
++//! `%TEMP%\victory-frametime.csv`. The file is truncated at the first row.
++//! This is deliberately release-buildable (no `diagnostics` feature): the
++//! frames it is meant to explain are the slow ones.
++
++use std::io::Write;
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
++use std::time::Instant;
++
++static ENABLED: OnceLock<bool> = OnceLock::new();
++static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
++static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
++
++/// When the previous present happened and how long the frames since the
++/// last summary took (microseconds, and a count).
++static LAST: Mutex<Option<Instant>> = Mutex::new(None);
++static MAX_US: AtomicU64 = AtomicU64::new(0);
++static SUM_US: AtomicU64 = AtomicU64::new(0);
++static COUNT: AtomicU64 = AtomicU64::new(0);
++
++fn enabled() -> bool {
++    *ENABLED.get_or_init(|| {
++        let Some(value) = std::env::var_os("VICTORY_FRAMETIME_DUMP") else {
++            return false;
++        };
++        if value.is_empty() {
++            return false;
++        }
++        let path = if value.to_str() == Some("1") {
++            std::env::temp_dir().join("victory-frametime.csv")
++        } else {
++            PathBuf::from(value)
++        };
++        let _ = PATH.set(Some(path));
++        true
++    })
++}
++
++fn file() -> Option<&'static Mutex<std::fs::File>> {
++    FILE.get_or_init(|| {
++        if !enabled() {
++            return None;
++        }
++        let path = PATH.get().and_then(Option::as_ref)?;
++        match std::fs::OpenOptions::new()
++            .create(true)
++            .write(true)
++            .truncate(true)
++            .open(path)
++        {
++            Ok(mut file) => {
++                let _ = file.write_all(HEADER.as_bytes());
++                let _ = file.flush();
++                tracing::info!(path = %path.display(), "frametime dump");
++                Some(Mutex::new(file))
++            }
++            Err(error) => {
++                tracing::warn!(path = %path.display(), %error, "no frametime dump");
++                None
++            }
++        }
++    })
++    .as_ref()
++}
++
++const HEADER: &str = "t_ms,frame,frames,fps,ms_per_frame,frame_ms_max,frame_ms_avg,\
++cpu_prepare_ms,gpu_ms,gpu_pct,copies_ms,copies_mb,textures_ms,textures_mb,\
++copyback_ms,copyback_mb,draws,dropped,making,indirect,heap_passes,heap_ms,\
++texture_refresh_ms,card_passes,card_compares,card_sent_mb,card_ranges,\
++card_pieces,card_fetched,card_fetched_mb,card_waits,card_wait_ms,\
++twins_into_depth,twins_into_colour,depth_planes,ram_mb,cpu_pct\n";
++
++/// Times one presented frame. Called for every present, before the frame
++/// summary's own one-second gate, so a slow frame is seen even when the
++/// summary is not printed.
++pub(crate) fn tick() {
++    if !enabled() {
++        return;
++    }
++    let now = Instant::now();
++    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(previous) = *last {
++        let micros = now.duration_since(previous).as_micros() as u64;
++        MAX_US.fetch_max(micros, Ordering::Relaxed);
++        SUM_US.fetch_add(micros, Ordering::Relaxed);
++        COUNT.fetch_add(1, Ordering::Relaxed);
++    }
++    *last = Some(now);
++}
++
++/// The worst and average frame in the interval, in milliseconds, and how
++/// many frames were timed; resets them.
++pub(crate) fn take_interval() -> (f64, f64, u64) {
++    let max = MAX_US.swap(0, Ordering::Relaxed) as f64 / 1000.0;
++    let sum = SUM_US.swap(0, Ordering::Relaxed) as f64 / 1000.0;
++    let count = COUNT.swap(0, Ordering::Relaxed);
++    let avg = if count > 0 {
++        sum / count as f64
++    } else {
++        0.0
++    };
++    (max, avg, count)
++}
++
++/// One summary interval's figures: times per frame in ms, sizes per frame in
++/// MB, counts per frame.
++#[derive(Default)]
++pub(crate) struct Row {
++    pub frame: u64,
++    pub frames: f64,
++    pub fps: f64,
++    pub ms: f64,
++    pub frame_ms_max: f64,
++    pub frame_ms_avg: f64,
++    pub cpu_prepare_ms: f64,
++    pub gpu_ms: f64,
++    pub gpu_pct: f64,
++    pub copies_ms: f64,
++    pub copies_mb: f64,
++    pub textures_ms: f64,
++    pub textures_mb: f64,
++    pub copyback_ms: f64,
++    pub copyback_mb: f64,
++    pub draws: f64,
++    pub dropped: f64,
++    pub making: f64,
++    pub indirect: f64,
++    pub heap_passes: f64,
++    pub heap_ms: f64,
++    pub texture_refresh_ms: f64,
++    pub card_passes: f64,
++    pub card_compares: f64,
++    pub card_sent_mb: f64,
++    pub card_ranges: f64,
++    pub card_pieces: f64,
++    pub card_fetched: f64,
++    pub card_fetched_mb: f64,
++    pub card_waits: f64,
++    pub card_wait_ms: f64,
++    pub twins_into_depth: f64,
++    pub twins_into_colour: f64,
++    pub depth_planes: f64,
++    pub ram_mb: f64,
++    pub cpu_pct: f64,
++}
++
++/// Appends `r` when the dump is on.
++pub(crate) fn record(r: &Row) {
++    let Some(file) = file() else {
++        return;
++    };
++    let t_ms = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_or(0, |d| d.as_millis());
++    let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
++    let _ = writeln!(
++        file,
++        "{t_ms},{frame},{frames:.3},{fps:.3},{ms:.3},{max:.3},{avg:.3},\
++         {cpu:.3},{gpu:.3},{gpu_pct:.3},{copies_ms:.3},{copies_mb:.3},\
++         {textures_ms:.3},{textures_mb:.3},{copyback_ms:.3},{copyback_mb:.3},\
++         {draws:.3},{dropped:.3},{making:.3},{indirect:.3},{heap_passes:.3},{heap_ms:.3},\
++         {texture_refresh_ms:.3},{card_passes:.3},{card_compares:.3},{card_sent_mb:.3},\
++         {card_ranges:.3},{card_pieces:.3},{card_fetched:.3},{card_fetched_mb:.3},\
++         {card_waits:.3},{card_wait_ms:.3},{twins_into_depth:.3},{twins_into_colour:.3},\
++         {depth_planes:.3},{ram_mb:.3},{cpu_pct:.3}",
++        frame = r.frame,
++        frames = r.frames,
++        fps = r.fps,
++        ms = r.ms,
++        max = r.frame_ms_max,
++        avg = r.frame_ms_avg,
++        cpu = r.cpu_prepare_ms,
++        gpu = r.gpu_ms,
++        gpu_pct = r.gpu_pct,
++        copies_ms = r.copies_ms,
++        copies_mb = r.copies_mb,
++        textures_ms = r.textures_ms,
++        textures_mb = r.textures_mb,
++        copyback_ms = r.copyback_ms,
++        copyback_mb = r.copyback_mb,
++        draws = r.draws,
++        dropped = r.dropped,
++        making = r.making,
++        indirect = r.indirect,
++        heap_passes = r.heap_passes,
++        heap_ms = r.heap_ms,
++        texture_refresh_ms = r.texture_refresh_ms,
++        card_passes = r.card_passes,
++        card_compares = r.card_compares,
++        card_sent_mb = r.card_sent_mb,
++        card_ranges = r.card_ranges,
++        card_pieces = r.card_pieces,
++        card_fetched = r.card_fetched,
++        card_fetched_mb = r.card_fetched_mb,
++        card_waits = r.card_waits,
++        card_wait_ms = r.card_wait_ms,
++        twins_into_depth = r.twins_into_depth,
++        twins_into_colour = r.twins_into_colour,
++        depth_planes = r.depth_planes,
++        ram_mb = r.ram_mb,
++        cpu_pct = r.cpu_pct,
++    );
++    let _ = file.flush();
++}
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 93eb73d..b6c00b9 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -6079,6 +6079,7 @@ impl Meter {
+         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
+         #[cfg(feature = "diagnostics")]
+         crate::copystat::presented();
++        crate::frametime::tick();
+         self.frames += 1;
+         #[cfg(feature = "diagnostics")]
+         {
+@@ -6129,33 +6130,30 @@ impl Meter {
+         late_line(frames);
+         card_clock_line(frames, ms);
+         crate::shadow::back_line(frames);
+-        {
+-            let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+-            if passes + compares > 0.0 {
+-                tracing::info!(
+-                    "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
+-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+-                    if rehash_runs() { "on" } else { "off" }
+-                );
+-            }
++        let [card_passes, card_pieces, card_compares] =
++            [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
++        if card_passes + card_compares > 0.0 {
++            tracing::info!(
++                "our passes over copies in the card's memory per frame: {card_passes:.0} hash passes over {card_pieces:.0} pieces after \
++                 ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {card_compares:.0} compare passes",
++                if rehash_runs() { "on" } else { "off" }
++            );
+         }
+-        {
+-            let [own, asking, still, all] =
+-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+-            if all >= 1.0 {
+-                tracing::info!(
+-                    "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
+-                     is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
+-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+-                );
+-            }
+-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+-            if through + left > 0.0 {
+-                tracing::info!(
+-                    "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
+-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+-                );
+-            }
++        let [own, asking, still, texture_refresh_ms] =
++            [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
++        if texture_refresh_ms >= 1.0 {
++            tracing::info!(
++                "texture refreshes per frame, all threads: {texture_refresh_ms:.1} ms, of them {own:.1} ms waiting for a texture another thread \
++                 is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
++                 hold still (the runtime remapping it); the rest is reading, hashing and detiling"
++            );
++        }
++        let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
++        if through + left > 0.0 {
++            tracing::info!(
++                "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
++                 {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
++            );
+         }
+         {
+             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+@@ -6183,6 +6181,47 @@ impl Meter {
+         // Over the same frames as the counts above.
+         #[cfg(feature = "diagnostics")]
+         let drops = crate::pipeline::take_drops();
++        // `VICTORY_FRAMETIME_DUMP`: one row per summary interval, with the
++        // buckets above and the worst/mean frame measured at each present.
++        let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
++        crate::frametime::record(&crate::frametime::Row {
++            frame: crate::queue::frame_count(),
++            frames,
++            fps,
++            ms,
++            frame_ms_max,
++            frame_ms_avg,
++            cpu_prepare_ms: cpu,
++            gpu_ms: gpu,
++            gpu_pct: self.gpu_pct,
++            copies_ms: copy_ms,
++            copies_mb: copy_mb,
++            textures_ms: texture_ms,
++            textures_mb: texture_mb,
++            copyback_ms: back_ms,
++            copyback_mb: back_mb,
++            draws,
++            dropped,
++            making: crate::pipeline::making() as f64,
++            indirect,
++            heap_passes: picked,
++            heap_ms: picked_ms,
++            texture_refresh_ms,
++            card_passes,
++            card_compares,
++            card_sent_mb: card[0] as f64 / frames / 1e6,
++            card_ranges: card[1] as f64 / frames,
++            card_pieces: card[2] as f64 / frames,
++            card_fetched: card[3] as f64 / frames,
++            card_fetched_mb: card[4] as f64 / frames / 1e6,
++            card_waits: card[5] as f64 / frames,
++            card_wait_ms: card[6] as f64 / frames / 1e3,
++            twins_into_depth: twin_to_depth,
++            twins_into_colour: twin_to_colour,
++            depth_planes: planes,
++            ram_mb: self.ram_mb,
++            cpu_pct: self.cpu_pct,
++        });
+         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+             self.logged = std::time::Instant::now();
+             tracing::info!(
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index db53f11..4efa8be 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -27,6 +27,7 @@ mod draw;
+ pub mod dxgi;
+ pub mod fence;
+ pub mod frame;
++mod frametime;
+ #[cfg(windows)]
+ mod host;
+ #[cfg(windows)]
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+index 11d3a8c..319dbb9 100644
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -745,6 +745,11 @@ fn system_timestamp() -> u64 {
+ /// Frames presented so far.
+ static FRAMES: AtomicU64 = AtomicU64::new(0);
+ 
++/// Frames presented so far (also in release builds).
++pub(crate) fn frame_count() -> u64 {
++    FRAMES.load(Ordering::Relaxed)
++}
++
+ #[cfg(feature = "diagnostics")]
+ pub(crate) fn presented() -> u64 {
+     FRAMES.load(Ordering::Relaxed)
+-- 
+2.55.0.windows.3
+
